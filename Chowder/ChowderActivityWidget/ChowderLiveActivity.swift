@@ -34,8 +34,7 @@ struct ChowderLiveActivity: Widget {
                 DynamicIslandExpandedRegion(.bottom) {
                     if let prev = context.state.previousIntent, !context.state.isFinished {
                         HStack(spacing: 6) {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 8, weight: .bold))
+                            Image("tick")
                                 .foregroundStyle(.green)
                             Text(prev)
                                 .font(.caption2)
@@ -153,18 +152,23 @@ struct ChowderLiveActivity: Widget {
             
             // Stacked cards for previous intents - keyed by the intent text itself
             ZStack {
-                if let endDate = state.intentEndDate {
-                    VStack(alignment: .center) {
-                        Image(systemName: "checkmark.circle.fill")
+                if state.intentEndDate != nil {
+                    VStack(alignment: .center, spacing: 8) {
+                        Image("tick")
                             .resizable()
                             .scaledToFit()
-                            .foregroundStyle(Color.green)
-                            .frame(width: 24)
-                            .background(Color.white, in: .circle)
+                            .foregroundStyle(Color.white)
+                            .frame(width: 28)
+                            .background(Color.green, in: .circle)
                             .compositingGroup()
-                        Text(state.subject ?? "Task complete")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(primaryForeground)
+                        VStack (spacing: 2) {
+                            Text(state.subject ?? "Task complete")
+                                .font(.subheadline.bold())
+                                .foregroundStyle(primaryForeground)
+                            Text("See more details…")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.bottom, 12)
@@ -205,7 +209,7 @@ struct ChowderLiveActivity: Widget {
                     .transition(.blurReplace)
                 }
             }
-            .frame(height: 70)
+            .frame(height: 80)
             .padding(.bottom, 8)
             .frame(maxHeight: .infinity)
             .zIndex(10)
@@ -255,7 +259,7 @@ struct ChowderLiveActivity: Widget {
             .padding(.leading, 4)
             .padding(.trailing, 12)
             .font(.footnote.bold())
-            .opacity(isWaiting || state.isFinished ? 0.24 : 1)
+            .opacity(isWaiting || state.isFinished ? 0.36 : 1)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 10)
@@ -283,13 +287,17 @@ struct IntentCard: View {
     let isBehind: Bool
     
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
+        HStack(spacing: 8) {
+            Image("tick")
                 .resizable()
                 .scaledToFit()
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.green)
-                .frame(width: 15)
+                .foregroundStyle(.black.opacity(0.5))
+                .frame(width: 21)
+                .background(
+                    Circle()
+                        .foregroundStyle(.black.opacity(0.12))
+                )
             
             Text(text)
                 .font(.callout)
