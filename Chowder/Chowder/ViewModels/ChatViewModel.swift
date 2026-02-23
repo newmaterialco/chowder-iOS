@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UserNotifications
 
 @Observable
 final class ChatViewModel: ChatServiceDelegate {
@@ -35,10 +36,169 @@ final class ChatViewModel: ChatServiceDelegate {
     var showSettings: Bool = false
     var debugLog: [String] = []
     var showDebugLog: Bool = false
+    var isInBackground: Bool = false
+    var pendingApprovals: [ApprovalRequest] = []
+    var showNotPairedAlert: Bool = false
+    @ObservationIgnored private var hasAttemptedIdentityReset = false
+
+    // MARK: - Voice Input / Output
+
+    @ObservationIgnored private let voiceInput = VoiceInputManager()
+    @ObservationIgnored private let voiceOutput = VoiceOutputManager()
+    @ObservationIgnored private var voicePermissionGranted: Bool?
+
+    /// Observable state — updated manually when voice manager changes.
+    var isListening: Bool = false
+    var isSpeakerEnabled: Bool = false
+
+    func toggleVoiceInput() {
+        // If already listening, just stop
+        if voiceInput.isListening {
+            voiceInput.stopListening()
+            isListening = false
+            return
+        }
+
+        // Check if we already know the permission result
+        if let granted = voicePermissionGranted {
+            if granted {
+                startVoiceListening()
+            } else {
+                log("Voice permissions denied — cannot start listening")
+            }
+            return
+        }
+
+        // First time: request permissions
+        voiceInput.requestPermissions { [weak self] granted in
+            guard let self else { return }
+            self.voicePermissionGranted = granted
+            if granted {
+                self.startVoiceListening()
+            } else {
+                self.log("Voice permissions denied: \(self.voiceInput.error ?? "unknown")")
+            }
+        }
+    }
+
+    private func startVoiceListening() {
+        voiceInput.onStoppedListening = { [weak self] in
+            self?.isListening = false
+        }
+        voiceInput.startListening { [weak self] text in
+            self?.inputText = text
+        }
+        isListening = true
+    }
+
+    func toggleSpeaker() {
+        voiceOutput.toggle()
+        isSpeakerEnabled = voiceOutput.isEnabled
+    }
+
+    // MARK: - Image Input
+
+    var stagedImage: UIImage?
+    var showImagePicker: Bool = false
+
+    /// Whether the send button should be enabled (text or image present).
+    var canSend: Bool {
+        let hasText = !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasImage = stagedImage != nil
+        return (hasText || hasImage) && !isLoading
+    }
+
+    // MARK: - Multi-Session
+
+    var savedSessions: [SavedSession] = []
+    var currentSessionKey: String = ConnectionConfig().sessionKey
+
+    func switchToSession(_ session: SavedSession) {
+        // Save current session's messages
+        LocalStorage.saveMessages(messages, forSession: currentSessionKey)
+        updateSessionMessageCount()
+
+        // Switch
+        currentSessionKey = session.key
+        messages = LocalStorage.loadMessages(forSession: session.key)
+        displayLimit = 50
+
+        // Update last used
+        if let idx = savedSessions.firstIndex(where: { $0.id == session.id }) {
+            savedSessions[idx].lastUsed = Date()
+        }
+        LocalStorage.saveSessions(savedSessions)
+
+        // Reconnect with new session key
+        chatService?.disconnect()
+        chatService = nil
+        isConnected = false
+
+        let config = ConnectionConfig()
+        let service = ChatService(
+            gatewayURL: config.gatewayURL,
+            token: config.token,
+            sessionKey: session.key
+        )
+        service.delegate = self
+        self.chatService = service
+        service.connect()
+        log("Switched to session: \(session.label) (\(session.key))")
+    }
+
+    func createSession(label: String, key: String) {
+        let session = SavedSession(key: key, label: label)
+        savedSessions.append(session)
+        LocalStorage.saveSessions(savedSessions)
+        log("Created session: \(label) (\(key))")
+    }
+
+    func deleteSession(_ session: SavedSession) {
+        savedSessions.removeAll { $0.id == session.id }
+        LocalStorage.saveSessions(savedSessions)
+        LocalStorage.deleteMessages(forSession: session.key)
+        log("Deleted session: \(session.label)")
+    }
+
+    func renameSession(_ session: SavedSession, newLabel: String) {
+        if let idx = savedSessions.firstIndex(where: { $0.id == session.id }) {
+            savedSessions[idx].label = newLabel
+            LocalStorage.saveSessions(savedSessions)
+        }
+    }
+
+    private func updateSessionMessageCount() {
+        if let idx = savedSessions.firstIndex(where: { $0.key == currentSessionKey }) {
+            savedSessions[idx].messageCount = messages.count
+            savedSessions[idx].lastUsed = Date()
+            LocalStorage.saveSessions(savedSessions)
+        }
+    }
+
+    private func loadSessions() {
+        savedSessions = LocalStorage.loadSessions()
+        if savedSessions.isEmpty {
+            // Create default session
+            let defaultSession = SavedSession.defaultSession
+            savedSessions = [defaultSession]
+            LocalStorage.saveSessions(savedSessions)
+        }
+    }
+
+    /// Background task identifier to keep WebSocket alive briefly after backgrounding.
+    @ObservationIgnored private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+    /// Tracks whether the agent was running when we entered background, so we can
+    /// check for a missed completion on return to foreground.
+    @ObservationIgnored private var wasLoadingWhenBackgrounded: Bool = false
+    /// Snapshot of assistant message count when we backgrounded, to detect new responses.
+    @ObservationIgnored private var assistantMessageCountAtBackground: Int = 0
 
     // Workspace-synced data from the gateway
     var botIdentity: BotIdentity = LocalStorage.loadBotIdentity()
     var userProfile: UserProfile = LocalStorage.loadUserProfile()
+
+    /// Current avatar image — observable so views update reactively.
+    var avatarImage: UIImage? = LocalStorage.loadAvatar()
 
     /// The bot's display name — uses IDENTITY.md name, falls back to "Chowder".
     var botName: String {
@@ -69,6 +229,9 @@ final class ChatViewModel: ChatServiceDelegate {
     @ObservationIgnored private var hasReceivedAnyDelta = false
 
     private var chatService: ChatService?
+
+    /// Expose the chat service so other tabs can make requests (e.g. cron).
+    var exposedChatService: ChatService? { chatService }
 
     var isConfigured: Bool {
         ConnectionConfig().isConfigured
@@ -163,6 +326,7 @@ final class ChatViewModel: ChatServiceDelegate {
 
     /// Push current tracking state to the Live Activity.
     private func pushLiveActivityUpdate(isAISubject: Bool = false) {
+        let approvalTool = pendingApprovals.first(where: { !$0.resolved })?.toolName
         LiveActivityManager.shared.update(
             subject: liveActivitySubject,
             currentIntent: liveActivityBottomText,
@@ -171,7 +335,8 @@ final class ChatViewModel: ChatServiceDelegate {
             secondPreviousIntent: liveActivityGreyIntent,
             stepNumber: liveActivityStepNumber,
             costTotal: liveActivityCost,
-            isAISubject: isAISubject
+            isAISubject: isAISubject,
+            pendingApprovalTool: approvalTool
         )
     }
 
@@ -238,11 +403,14 @@ final class ChatViewModel: ChatServiceDelegate {
     func connect() {
         log("connect() called")
 
+        // Load saved sessions
+        loadSessions()
+
         // Restore chat history from disk on first launch
         if messages.isEmpty {
-            messages = LocalStorage.loadMessages()
+            messages = LocalStorage.loadMessages(forSession: currentSessionKey)
             if !messages.isEmpty {
-                log("Restored \(messages.count) messages from disk")
+                log("Restored \(messages.count) messages from disk for session \(currentSessionKey)")
             }
         }
 
@@ -278,26 +446,36 @@ final class ChatViewModel: ChatServiceDelegate {
     func send() {
         log("send() — isConnected=\(isConnected) isLoading=\(isLoading)")
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isLoading else { return }
+        let image = stagedImage
+        guard (!text.isEmpty || image != nil), !isLoading else { return }
+
+        // Stop voice input if active
+        if voiceInput.isListening {
+            voiceInput.stopListening()
+            isListening = false
+        }
 
         hasPlayedResponseHaptic = false
         hasReceivedAnyDelta = false
         responseHaptic.prepare()
 
-        messages.append(Message(role: .user, content: text))
+        // Build the user message (with optional image attachment)
+        let userMessage = Message(role: .user, content: text, imageData: image?.jpegData(compressionQuality: 0.7))
+        messages.append(userMessage)
         inputText = ""
+        stagedImage = nil
         isLoading = true
 
         // Start a fresh activity tracker for this agent turn
         currentActivity = AgentActivity()
         currentActivity?.currentLabel = "Thinking..."
         shimmerStartTime = Date()
-        
+
         // Increment generation counter and capture start time to filter old items
         currentRunGeneration += 1
         currentRunStartTime = Date()
         log("Starting new run generation \(currentRunGeneration) at \(currentRunStartTime!)")
-        
+
         // Clear history parsing state for new run
         seenThinkingIds.removeAll()
         seenToolCallIds.removeAll()
@@ -308,11 +486,13 @@ final class ChatViewModel: ChatServiceDelegate {
 
         messages.append(Message(role: .assistant, content: ""))
 
-        LocalStorage.saveMessages(messages)
+        LocalStorage.saveMessages(messages, forSession: currentSessionKey)
+        updateSessionMessageCount()
 
         // Start the Live Activity immediately (subject will be updated when ready)
         let agentName = botName
-        LiveActivityManager.shared.startActivity(agentName: agentName, userTask: text, subject: nil)
+        let displayText = text.isEmpty ? "[Image]" : text
+        LiveActivityManager.shared.startActivity(agentName: agentName, userTask: displayText, subject: nil, avatarImage: avatarImage)
 
         // Generate AI summary for every message sent
         // Include up to the last 5 user messages to identify the overall task
@@ -331,14 +511,21 @@ final class ChatViewModel: ChatServiceDelegate {
             }
         }
 
-        chatService?.send(text: text)
-        log("chatService.send() called")
+        // Send with or without image
+        if let imageData = image?.jpegData(compressionQuality: 0.7) {
+            chatService?.sendWithImage(text: text, imageData: imageData)
+            log("chatService.sendWithImage() called")
+        } else {
+            chatService?.send(text: text)
+            log("chatService.send() called")
+        }
     }
 
     func clearMessages() {
         messages.removeAll()
-        LocalStorage.deleteMessages()
-        log("Chat history cleared")
+        LocalStorage.deleteMessages(forSession: currentSessionKey)
+        updateSessionMessageCount()
+        log("Chat history cleared for session \(currentSessionKey)")
     }
 
     // MARK: - ChatServiceDelegate (main chat session)
@@ -346,6 +533,7 @@ final class ChatViewModel: ChatServiceDelegate {
     func chatServiceDidConnect() {
         log("CONNECTED")
         isConnected = true
+        hasAttemptedIdentityReset = false
         
         // Workspace sync disabled - identity/profile are updated via tool events
         // when the agent writes to IDENTITY.md or USER.md
@@ -381,14 +569,8 @@ final class ChatViewModel: ChatServiceDelegate {
                 lastCompletedActivity = currentActivity
                 currentActivity = nil
                 shimmerStartTime = nil
-                // End the Lock Screen Live Activity now that the answer is streaming
-                let taskTitle = liveActivitySubject
-                Task {
-                    let completionSummary = await generateCompletionSummary(from: taskTitle)
-                    await MainActor.run {
-                        LiveActivityManager.shared.endActivity(completionSummary: completionSummary)
-                    }
-                }
+                // Don't end the Live Activity here — wait for chatServiceDidFinishMessage
+                // so we can show the full response in the Live Activity.
                 log("Cleared activity on first delta")
             }
         }
@@ -399,12 +581,18 @@ final class ChatViewModel: ChatServiceDelegate {
     }
 
     func chatServiceDidFinishMessage() {
-        log("message.done - isLoading was \(isLoading)")
-        
+        log("message.done - isLoading was \(isLoading), isInBackground=\(isInBackground)")
+
+        // Fire local notification if app is backgrounded (WebSocket stayed alive via background task)
+        if isInBackground {
+            wasLoadingWhenBackgrounded = false
+            endBackgroundTask()
+        }
+
         // Force isLoading false
         isLoading = false
         hasPlayedResponseHaptic = false
-        
+
         log("Set isLoading=false, hasPlayedResponseHaptic=false, hasReceivedAnyDelta=\(hasReceivedAnyDelta)")
 
         // Mark all remaining in-progress steps as completed
@@ -415,13 +603,14 @@ final class ChatViewModel: ChatServiceDelegate {
             lastCompletedActivity = activity
             log("Preserved activity with \(activity.steps.count) steps")
         }
-        
-        // End the Lock Screen Live Activity with completion summary
+
+        // End the Lock Screen Live Activity: show "Complete", then the response preview
         let taskTitle = liveActivitySubject
+        let responsePreview = messages.last(where: { $0.role == .assistant })?.content
         Task {
             let completionSummary = await generateCompletionSummary(from: taskTitle)
             await MainActor.run {
-                LiveActivityManager.shared.endActivity(completionSummary: completionSummary)
+                LiveActivityManager.shared.endActivity(completionSummary: completionSummary, responsePreview: responsePreview)
             }
         }
 
@@ -453,13 +642,20 @@ final class ChatViewModel: ChatServiceDelegate {
                        self.messages[lastIdx].content.isEmpty {
                         self.messages.remove(at: lastIdx)
                         self.log("Removed empty assistant bubble (final fetch timeout)")
-                        LocalStorage.saveMessages(self.messages)
+                        LocalStorage.saveMessages(self.messages, forSession: self.currentSessionKey)
                     }
                 }
             }
         }
-        
-        LocalStorage.saveMessages(messages)
+
+        // Auto-speak the assistant's response if TTS is enabled
+        if let lastMsg = messages.last(where: { $0.role == .assistant }),
+           !lastMsg.content.isEmpty {
+            voiceOutput.speak(lastMsg.content)
+        }
+
+        LocalStorage.saveMessages(messages, forSession: currentSessionKey)
+        updateSessionMessageCount()
     }
 
     func chatServiceDidReceiveError(_ error: Error) {
@@ -473,7 +669,7 @@ final class ChatViewModel: ChatServiceDelegate {
         isLoading = false
         currentActivity = nil
         LiveActivityManager.shared.endActivity()
-        LocalStorage.saveMessages(messages)
+        LocalStorage.saveMessages(messages, forSession: currentSessionKey)
     }
 
     /// Map raw system errors into short, human-friendly messages.
@@ -667,6 +863,59 @@ final class ChatViewModel: ChatServiceDelegate {
         LocalStorage.saveBotIdentity(identity)
     }
 
+    func chatServiceDidUpdateAvatar(_ image: UIImage) {
+        log("Avatar image updated — saving to local and shared storage")
+        LocalStorage.saveAvatar(image)
+        avatarImage = image
+    }
+
+    func chatServiceDidReceiveApproval(_ request: ApprovalRequest) {
+        log("🔐 Approval request received: \(request.toolName) — \(request.description)")
+        pendingApprovals.append(request)
+
+        // Update Live Activity to show waiting for approval
+        LiveActivityManager.shared.updateIntent("Waiting for approval: \(request.toolName)")
+
+        // Fire notification if backgrounded
+        if isInBackground {
+            let content = UNMutableNotificationContent()
+            content.title = "\(botName) needs approval"
+            content.body = "\(request.toolName): \(request.description)"
+            content.sound = .default
+            let notifRequest = UNNotificationRequest(identifier: request.id, content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(notifRequest)
+        }
+    }
+
+    func handleApprovalResponse(id: String, approved: Bool) {
+        log("🔐 Approval response: \(id) — \(approved ? "approved" : "denied")")
+        chatService?.respondToApproval(requestId: id, approved: approved)
+
+        // Mark as resolved in the list
+        if let index = pendingApprovals.firstIndex(where: { $0.id == id }) {
+            pendingApprovals[index].resolved = true
+            pendingApprovals[index].approved = approved
+        }
+    }
+
+    func chatServiceDidReceiveNotPaired() {
+        isConnected = false
+        isLoading = false
+
+        if !hasAttemptedIdentityReset {
+            // First attempt: reset keypair and reconnect automatically.
+            // The gateway will see a fresh device with a valid token and auto-pair it.
+            hasAttemptedIdentityReset = true
+            log("🔐 NOT_PAIRED — resetting device identity and reconnecting")
+            DeviceIdentity.resetIdentity()
+            reconnect()
+        } else {
+            // Already tried resetting — gateway requires manual approval.
+            log("🔐 NOT_PAIRED again — showing alert for manual re-pair")
+            showNotPairedAlert = true
+        }
+    }
+
     func chatServiceDidUpdateUserProfile(_ profile: UserProfile) {
         log("User profile updated via tool event — name=\(profile.name)")
         self.userProfile = profile
@@ -738,7 +987,7 @@ final class ChatViewModel: ChatServiceDelegate {
             hasPlayedResponseHaptic = true
             responseHaptic.impactOccurred()
         }
-        LocalStorage.saveMessages(self.messages)
+        LocalStorage.saveMessages(self.messages, forSession: self.currentSessionKey)
     }
 
     /// Parse a single history item and update activity
@@ -782,7 +1031,7 @@ final class ChatViewModel: ChatServiceDelegate {
                    messages[lastIndex].role == .assistant,
                    messages[lastIndex].content.isEmpty {
                     messages[lastIndex].content = "Error: \(errorMessage)"
-                    LocalStorage.saveMessages(messages)
+                    LocalStorage.saveMessages(messages, forSession: currentSessionKey)
                 }
                 return
             }
@@ -1210,6 +1459,90 @@ final class ChatViewModel: ChatServiceDelegate {
 
     // MARK: - Workspace Data Management
 
+    // MARK: - Background / Foreground Lifecycle
+
+    /// Called when the app enters background. Starts a background task to keep the
+    /// WebSocket alive so `chatServiceDidFinishMessage` can fire and send a notification.
+    func didEnterBackground() {
+        isInBackground = true
+        wasLoadingWhenBackgrounded = isLoading
+        assistantMessageCountAtBackground = messages.filter { $0.role == .assistant }.count
+        log("📱 Entered background — isLoading=\(isLoading)")
+
+        guard isLoading else { return }
+
+        // Request background execution time (~30s) so the WebSocket can receive the finish event
+        backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "AgentResponse") { [weak self] in
+            // Expiration handler — OS is about to suspend us
+            self?.log("📱 Background task expired")
+            self?.endBackgroundTask()
+        }
+        log("📱 Started background task \(backgroundTaskId.rawValue)")
+    }
+
+    /// Called when the app returns to foreground. Checks if we missed a completion while away.
+    func didReturnToForeground() {
+        let wasBg = isInBackground
+        isInBackground = false
+        endBackgroundTask()
+        log("📱 Returned to foreground — wasLoading=\(wasLoadingWhenBackgrounded)")
+
+        // Clear delivered notifications from the lock screen / notification center
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+
+        // Dismiss only ended Live Activities — active ones (agent still running) stay.
+        // This means the activity persists on the lock screen after task completion,
+        // and clears once the user opens the app (by tapping it or otherwise).
+        LiveActivityManager.shared.dismissEndedActivities()
+
+        // If agent was running when we backgrounded and finished while we were away,
+        // the notification should have already fired from chatServiceDidFinishMessage.
+        // But if the WebSocket died before the event arrived, detect it on reconnect:
+        // reconnect() is called separately by ChatView, which will re-establish the
+        // connection. If the agent finished, lifecycle.end will arrive and
+        // chatServiceDidFinishMessage will fire. But isInBackground is now false.
+        // So we need a different approach: check after reconnect if loading ended.
+        if wasLoadingWhenBackgrounded && wasBg {
+            // Schedule a check after reconnect settles — if the agent completed while
+            // we were suspended (no lifecycle.end received), the history fetch or
+            // reconnect will set isLoading=false. Fire notification then.
+            let gen = currentRunGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, self.currentRunGeneration == gen else { return }
+                if !self.isLoading && self.wasLoadingWhenBackgrounded {
+                    // Agent finished while we were away — check if new assistant message appeared
+                    let currentAssistantCount = self.messages.filter { $0.role == .assistant }.count
+                    let lastMsg = self.messages.last(where: { $0.role == .assistant })?.content ?? ""
+                    if currentAssistantCount > self.assistantMessageCountAtBackground || !lastMsg.isEmpty {
+                        // Notification disabled — response is shown in Live Activity instead
+                    }
+                    self.wasLoadingWhenBackgrounded = false
+                }
+            }
+        }
+    }
+
+    /// Fire a local notification with the latest agent response.
+    private func fireBackgroundNotification() {
+        let lastMsg = messages.last(where: { $0.role == .assistant })?.content ?? ""
+        let body = lastMsg.isEmpty ? "Your agent has replied." : String(lastMsg.prefix(100))
+
+        let content = UNMutableNotificationContent()
+        content.title = botName
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+        log("🔔 Fired background notification: \(body.prefix(50))")
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTaskId != .invalid else { return }
+        log("📱 Ending background task \(backgroundTaskId.rawValue)")
+        UIApplication.shared.endBackgroundTask(backgroundTaskId)
+        backgroundTaskId = .invalid
+    }
+
     /// Save workspace data to local cache (used by Settings save).
     func saveWorkspaceData(identity: BotIdentity, profile: UserProfile) {
         self.botIdentity = identity
@@ -1217,5 +1550,19 @@ final class ChatViewModel: ChatServiceDelegate {
         LocalStorage.saveBotIdentity(identity)
         LocalStorage.saveUserProfile(profile)
         log("Settings saved to local cache")
+    }
+
+    /// Save a manually uploaded avatar image (from Settings photo picker).
+    func saveManualAvatar(_ image: UIImage) {
+        LocalStorage.saveAvatar(image)
+        avatarImage = image
+        log("Manual avatar saved")
+    }
+
+    /// Delete the avatar image (from Settings).
+    func deleteAvatar() {
+        LocalStorage.deleteAvatar()
+        avatarImage = nil
+        log("Avatar deleted")
     }
 }

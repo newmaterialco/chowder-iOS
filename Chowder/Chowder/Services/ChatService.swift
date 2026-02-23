@@ -11,8 +11,11 @@ protocol ChatServiceDelegate: AnyObject {
     func chatServiceDidReceiveThinkingDelta(_ text: String)
     func chatServiceDidReceiveToolEvent(name: String, path: String?, args: [String: Any]?)
     func chatServiceDidUpdateBotIdentity(_ identity: BotIdentity)
+    func chatServiceDidUpdateAvatar(_ image: UIImage)
     func chatServiceDidUpdateUserProfile(_ profile: UserProfile)
     func chatServiceDidReceiveHistoryMessages(_ messages: [[String: Any]])
+    func chatServiceDidReceiveApproval(_ request: ApprovalRequest)
+    func chatServiceDidReceiveNotPaired()
 }
 
 final class ChatService: NSObject {
@@ -211,6 +214,89 @@ final class ChatService: NSObject {
         }
     }
 
+    /// Send a message with an image attachment.
+    /// The gateway expects `message` as a string, so we embed the image as a
+    /// base64 data URI in the `attachments` array and send text separately.
+    func sendWithImage(text: String, imageData: Data) {
+        guard isConnected else {
+            log("[SEND] ⚠️ Not connected — dropping message")
+            return
+        }
+
+        let requestId = makeRequestId()
+        let idempotencyKey = UUID().uuidString
+        let base64Image = imageData.base64EncodedString()
+
+        // Gateway expects: message (string), attachments (array of {mimeType, content})
+        // content must be raw base64, NOT a data URI
+        let messageText = text.isEmpty ? "[Attached image]" : text
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": requestId,
+            "method": "chat.send",
+            "params": [
+                "message": messageText,
+                "sessionKey": sessionKey,
+                "idempotencyKey": idempotencyKey,
+                "deliver": true,
+                "attachments": [
+                    [
+                        "type": "image",
+                        "mimeType": "image/jpeg",
+                        "fileName": "photo.jpg",
+                        "content": base64Image
+                    ]
+                ]
+            ]
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let jsonString = String(data: data, encoding: .utf8) else { return }
+
+        log("[SEND] Sending chat.send with image id=\(requestId) (\(text.count) chars + \(imageData.count) bytes image)")
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error {
+                self?.log("[SEND] ❌ Error: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self?.delegate?.chatServiceDidReceiveError(error)
+                }
+            } else {
+                self?.log("[SEND] ✅ chat.send with image sent OK")
+            }
+        }
+    }
+
+    /// Respond to an agent approval request.
+    func respondToApproval(requestId: String, approved: Bool) {
+        guard isConnected else {
+            log("[APPROVAL] ⚠️ Not connected — dropping response")
+            return
+        }
+
+        let reqId = makeRequestId()
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": reqId,
+            "method": "exec.approval.resolve",
+            "params": [
+                "id": requestId,
+                "decision": approved ? "allow-once" : "deny"
+            ]
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let jsonString = String(data: data, encoding: .utf8) else { return }
+
+        log("[APPROVAL] Sending \(approved ? "approve" : "deny") for \(requestId)")
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error {
+                self?.log("[APPROVAL] ❌ Error: \(error.localizedDescription)")
+            } else {
+                self?.log("[APPROVAL] ✅ Response sent")
+            }
+        }
+    }
+
     /// Request chat history for the current session (for polling during active runs)
     private func requestChatHistory() {
         guard isConnected, activeRunId != nil, !historyRequestInFlight else {
@@ -346,6 +432,154 @@ final class ChatService: NSObject {
         }
     }
 
+    // MARK: - Private: Avatar Fetch
+
+    /// Fetch the agent's avatar image from IDENTITY.md's avatar field.
+    /// Supports http/https URLs and workspace-relative paths (fetched via agents.files.get).
+    private func fetchAvatarImage(from avatarString: String) {
+        let trimmed = avatarString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            // Direct URL download
+            guard let url = URL(string: trimmed) else {
+                log("[AVATAR] ❌ Invalid URL: \(trimmed)")
+                return
+            }
+            log("[AVATAR] Downloading from URL: \(trimmed)")
+            URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+                if let error {
+                    self?.log("[AVATAR] ❌ Download error: \(error.localizedDescription)")
+                    return
+                }
+                guard let data, let image = UIImage(data: data) else {
+                    self?.log("[AVATAR] ❌ Could not create image from data")
+                    return
+                }
+                self?.log("[AVATAR] ✅ Downloaded avatar image")
+                DispatchQueue.main.async {
+                    self?.delegate?.chatServiceDidUpdateAvatar(image)
+                }
+            }.resume()
+        } else if trimmed.hasPrefix("data:") {
+            // Data URI (e.g. data:image/png;base64,...)
+            if let commaIndex = trimmed.firstIndex(of: ",") {
+                let base64 = String(trimmed[trimmed.index(after: commaIndex)...])
+                if let data = Data(base64Encoded: base64), let image = UIImage(data: data) {
+                    log("[AVATAR] ✅ Decoded data URI avatar")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.chatServiceDidUpdateAvatar(image)
+                    }
+                }
+            }
+        } else {
+            // Workspace-relative path — fetch via gateway
+            log("[AVATAR] Fetching workspace file: \(trimmed)")
+            fetchAvatarWorkspaceFile(trimmed)
+        }
+    }
+
+    /// Fetch an avatar image file from the gateway workspace using agents.files.get.
+    private func fetchAvatarWorkspaceFile(_ path: String) {
+        let requestId = makeRequestId()
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": requestId,
+            "method": "agents.files.get",
+            "params": [
+                "agentId": "main",
+                "name": path
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let jsonString = String(data: data, encoding: .utf8) else { return }
+        log("[AVATAR] Requesting workspace file: \(path)")
+        // Tag the request so handleResponse can identify avatar file responses
+        pendingAvatarFileRequest = requestId
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error {
+                self?.log("[AVATAR] ❌ Error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Tracks the request ID for an in-flight avatar file fetch.
+    private var pendingAvatarFileRequest: String?
+
+    /// Generic response handlers keyed by request ID.
+    /// When a `type:"res"` frame arrives, if a handler exists for its ID,
+    /// the handler is called and removed — bypassing the default response logic.
+    private var responseHandlers: [String: (Bool, [String: Any]?) -> Void] = [:]
+
+    /// Send a generic request and register a one-shot response handler.
+    func sendRequest(method: String, params: [String: Any] = [:], completion: @escaping (Bool, [String: Any]?) -> Void) {
+        guard isConnected else {
+            log("[REQUEST] \u{26a0}\u{fe0f} Not connected — dropping \(method)")
+            completion(false, nil)
+            return
+        }
+
+        let requestId = makeRequestId()
+        responseHandlers[requestId] = completion
+
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": requestId,
+            "method": method,
+            "params": params
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            responseHandlers.removeValue(forKey: requestId)
+            completion(false, nil)
+            return
+        }
+
+        log("[REQUEST] Sending \(method) id=\(requestId)")
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error {
+                self?.log("[REQUEST] \u{274c} Error sending \(method): \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self?.responseHandlers.removeValue(forKey: requestId)
+                    completion(false, nil)
+                }
+            }
+        }
+    }
+
+    // MARK: - Cron Job Methods
+
+    /// Fetch all cron jobs (including disabled ones).
+    func fetchCronJobs(completion: @escaping (Bool, [[String: Any]]?) -> Void) {
+        sendRequest(method: "cron.list", params: ["includeDisabled": true]) { ok, payload in
+            let jobs = payload?["jobs"] as? [[String: Any]]
+            completion(ok, jobs)
+        }
+    }
+
+    /// Fetch run history for a specific cron job.
+    func fetchCronRuns(jobId: String, limit: Int = 20, completion: @escaping (Bool, [[String: Any]]?) -> Void) {
+        sendRequest(method: "cron.runs", params: ["jobId": jobId, "limit": limit]) { ok, payload in
+            let runs = payload?["runs"] as? [[String: Any]]
+            completion(ok, runs)
+        }
+    }
+
+    /// Fetch cron status overview.
+    func fetchCronStatus(completion: @escaping (Bool, [String: Any]?) -> Void) {
+        sendRequest(method: "cron.status") { ok, payload in
+            completion(ok, payload)
+        }
+    }
+
+    /// Trigger a manual cron job run.
+    func runCronJob(jobId: String, completion: @escaping (Bool, [String: Any]?) -> Void) {
+        sendRequest(method: "cron.run", params: ["jobId": jobId]) { ok, payload in
+            completion(ok, payload)
+        }
+    }
+
     // MARK: - Private: Connect Handshake
 
     /// Send the `connect` request after receiving the gateway's challenge nonce.
@@ -358,7 +592,7 @@ final class ChatService: NSObject {
         let clientId = "openclaw-ios"
         let clientMode = "ui"
         let role = "operator"
-        let scopes = ["operator.read", "operator.write"]
+        let scopes = ["operator.read", "operator.write", "operator.approvals", "operator.admin"]
 
         let signed = DeviceIdentity.sign(
             clientId: clientId,
@@ -394,6 +628,7 @@ final class ChatService: NSObject {
                     "signedAt": signed.signedAt,
                     "nonce": nonce
                 ],
+                "caps": ["tool-events"],
                 "locale": Locale.current.identifier,
                 "userAgent": "chowder-ios/1.0.0"
             ]
@@ -569,8 +804,11 @@ final class ChatService: NSObject {
                        let content = args?["content"] as? String {
                         if filePath.hasSuffix("IDENTITY.md") {
                             let identity = BotIdentity.from(markdown: content)
-                            self.log("[SYNC] Detected write to IDENTITY.md — name=\(identity.name)")
+                            self.log("[SYNC] Detected write to IDENTITY.md — name=\(identity.name) avatar=\(identity.avatar)")
                             self.delegate?.chatServiceDidUpdateBotIdentity(identity)
+                            if !identity.avatar.isEmpty {
+                                self.fetchAvatarImage(from: identity.avatar)
+                            }
                         } else if filePath.hasSuffix("USER.md") {
                             let profile = UserProfile.from(markdown: content)
                             self.log("[SYNC] Detected write to USER.md — name=\(profile.name)")
@@ -634,7 +872,30 @@ final class ChatService: NSObject {
                 self.delegate?.chatServiceDidReceiveError(ChatServiceError.gatewayError(msg))
 
             default:
-                self.log("[HANDLE] Event: \(event)")
+                // Check for approval request events (e.g. exec.approval.requested)
+                if event.contains("approval") {
+                    self.log("[HANDLE] 🔐 Approval event: \(event)")
+                    let requestId = payload?["id"] as? String ?? UUID().uuidString
+                    // The payload has a nested "request" object with command, host, cwd, etc.
+                    let innerRequest = payload?["request"] as? [String: Any]
+                    let command = innerRequest?["command"] as? String ?? "Unknown command"
+                    let cwd = innerRequest?["cwd"] as? String
+                    let host = innerRequest?["host"] as? String ?? "node"
+                    let desc = cwd != nil
+                        ? "Run \(command) in \(cwd!)"
+                        : "Run \(command)"
+
+                    let request = ApprovalRequest(
+                        id: requestId,
+                        toolName: "\(host): \(command)",
+                        description: desc,
+                        args: innerRequest,
+                        timestamp: Date()
+                    )
+                    self.delegate?.chatServiceDidReceiveApproval(request)
+                } else {
+                    self.log("[HANDLE] Event: \(event)")
+                }
             }
         }
     }
@@ -645,6 +906,20 @@ final class ChatService: NSObject {
         let ok = json["ok"] as? Bool ?? false
         let payload = json["payload"] as? [String: Any]
         let error = json["error"] as? [String: Any]
+
+        // Check for a registered one-shot response handler first.
+        if let handler = responseHandlers.removeValue(forKey: id) {
+            let result = ok ? payload : error
+            if !ok {
+                let code = error?["code"] as? String ?? "unknown"
+                let message = error?["message"] as? String ?? "Request failed"
+                log("[REQUEST] \u{274c} Response error id=\(id) code=\(code) message=\(message)")
+            }
+            DispatchQueue.main.async {
+                handler(ok, result)
+            }
+            return
+        }
 
         if ok {
             let payloadType = payload?["type"] as? String
@@ -670,9 +945,12 @@ final class ChatService: NSObject {
                let filePath = (file["name"] as? String) ?? (file["path"] as? String) {
                 if filePath.hasSuffix("IDENTITY.md") {
                     let identity = BotIdentity.from(markdown: content)
-                    log("[SYNC] Fetched IDENTITY.md — name=\(identity.name)")
+                    log("[SYNC] Fetched IDENTITY.md — name=\(identity.name) avatar=\(identity.avatar)")
                     DispatchQueue.main.async { [weak self] in
                         self?.delegate?.chatServiceDidUpdateBotIdentity(identity)
+                    }
+                    if !identity.avatar.isEmpty {
+                        fetchAvatarImage(from: identity.avatar)
                     }
                 } else if filePath.hasSuffix("USER.md") {
                     let profile = UserProfile.from(markdown: content)
@@ -680,6 +958,23 @@ final class ChatService: NSObject {
                     DispatchQueue.main.async { [weak self] in
                         self?.delegate?.chatServiceDidUpdateUserProfile(profile)
                     }
+                }
+                return
+            }
+
+            // Handle avatar workspace file response (binary content as base64)
+            if let reqId = pendingAvatarFileRequest, id == reqId {
+                pendingAvatarFileRequest = nil
+                if let file = payload?["file"] as? [String: Any],
+                   let contentB64 = file["content"] as? String,
+                   let data = Data(base64Encoded: contentB64),
+                   let image = UIImage(data: data) {
+                    log("[AVATAR] ✅ Loaded avatar from workspace file")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.chatServiceDidUpdateAvatar(image)
+                    }
+                } else {
+                    log("[AVATAR] ⚠️ Could not decode avatar from workspace response")
                 }
                 return
             }
@@ -728,8 +1023,20 @@ final class ChatService: NSObject {
             let code = error?["code"] as? String ?? "unknown"
             let message = error?["message"] as? String ?? json["error"] as? String ?? "Request failed"
             log("[HANDLE] ❌ res error id=\(id) code=\(code) message=\(message)")
-            DispatchQueue.main.async { [weak self] in
-                self?.delegate?.chatServiceDidReceiveError(ChatServiceError.gatewayError("\(code): \(message)"))
+
+            if code == "NOT_PAIRED" {
+                // Device identity changed (e.g. Keychain wiped on reinstall).
+                // Stop reconnect loop and notify delegate to show re-pair UI.
+                shouldReconnect = false
+                stopHistoryPolling()
+                DispatchQueue.main.async { [weak self] in
+                    self?.isConnected = false
+                    self?.delegate?.chatServiceDidReceiveNotPaired()
+                }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.chatServiceDidReceiveError(ChatServiceError.gatewayError("\(code): \(message)"))
+                }
             }
         }
     }

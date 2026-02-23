@@ -11,34 +11,99 @@ enum LocalStorage {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
-    // MARK: - Chat History
-
-    private static var chatHistoryURL: URL {
-        documentsURL.appendingPathComponent("chat_history.json")
+    /// Per-session directory for message storage.
+    private static func sessionDirectory(for sessionKey: String) -> URL {
+        let sanitized = sessionKey
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+        let dir = documentsURL.appendingPathComponent("sessions/\(sanitized)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
-    static func saveMessages(_ messages: [Message]) {
+    // MARK: - Chat History (per-session)
+
+    static func saveMessages(_ messages: [Message], forSession sessionKey: String) {
+        let url = sessionDirectory(for: sessionKey).appendingPathComponent("chat_history.json")
         do {
             let data = try JSONEncoder().encode(messages)
-            try data.write(to: chatHistoryURL, options: .atomic)
+            try data.write(to: url, options: .atomic)
         } catch {
             print("[LocalStorage] Failed to save messages: \(error)")
         }
     }
 
-    static func loadMessages() -> [Message] {
+    static func loadMessages(forSession sessionKey: String) -> [Message] {
+        let url = sessionDirectory(for: sessionKey).appendingPathComponent("chat_history.json")
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let data = try Data(contentsOf: url)
+                let messages = try JSONDecoder().decode([Message].self, from: data)
+                if !messages.isEmpty {
+                    return messages
+                }
+                // File exists but is empty — fall through to legacy
+            } catch {
+                print("[LocalStorage] Failed to load per-session messages: \(error)")
+                // Fall through to legacy on decode error (e.g. schema change)
+            }
+        }
+
+        // Migration: try loading from legacy location
+        let legacy = loadLegacyMessages()
+        if !legacy.isEmpty {
+            print("[LocalStorage] Migrated \(legacy.count) messages from legacy to session \(sessionKey)")
+            // Save to per-session location so we don't migrate again
+            saveMessages(legacy, forSession: sessionKey)
+        }
+        return legacy
+    }
+
+    static func deleteMessages(forSession sessionKey: String) {
+        let url = sessionDirectory(for: sessionKey).appendingPathComponent("chat_history.json")
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    // Legacy support (single-session)
+    private static var chatHistoryURL: URL {
+        documentsURL.appendingPathComponent("chat_history.json")
+    }
+
+    private static func loadLegacyMessages() -> [Message] {
         guard FileManager.default.fileExists(atPath: chatHistoryURL.path) else { return [] }
         do {
             let data = try Data(contentsOf: chatHistoryURL)
             return try JSONDecoder().decode([Message].self, from: data)
         } catch {
-            print("[LocalStorage] Failed to load messages: \(error)")
+            print("[LocalStorage] Failed to load legacy messages: \(error)")
             return []
         }
     }
 
-    static func deleteMessages() {
-        try? FileManager.default.removeItem(at: chatHistoryURL)
+    // MARK: - Saved Sessions
+
+    private static var sessionsURL: URL {
+        documentsURL.appendingPathComponent("saved_sessions.json")
+    }
+
+    static func saveSessions(_ sessions: [SavedSession]) {
+        do {
+            let data = try JSONEncoder().encode(sessions)
+            try data.write(to: sessionsURL, options: .atomic)
+        } catch {
+            print("[LocalStorage] Failed to save sessions: \(error)")
+        }
+    }
+
+    static func loadSessions() -> [SavedSession] {
+        guard FileManager.default.fileExists(atPath: sessionsURL.path) else { return [] }
+        do {
+            let data = try Data(contentsOf: sessionsURL)
+            return try JSONDecoder().decode([SavedSession].self, from: data)
+        } catch {
+            print("[LocalStorage] Failed to load sessions: \(error)")
+            return []
+        }
     }
 
     // MARK: - Agent Avatar

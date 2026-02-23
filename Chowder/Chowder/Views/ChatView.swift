@@ -1,10 +1,11 @@
 import SwiftUI
 
 struct ChatView: View {
-    @State private var viewModel = ChatViewModel()
+    @Bindable var viewModel: ChatViewModel
+    @Binding var selectedTab: Tab
     @State private var isAtBottom = true
+    @State private var showSearch = false
     @FocusState private var isInputFocused: Bool
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(spacing: 0) {
@@ -53,6 +54,16 @@ struct ChatView: View {
                             .transition(.opacity.animation(.easeOut(duration: 0.15)))
                         }
 
+                        // Approval cards — shown inline when agent needs user approval
+                        ForEach(viewModel.pendingApprovals, id: \.id) { request in
+                            ApprovalCardView(
+                                request: request,
+                                onApprove: { viewModel.handleApprovalResponse(id: request.id, approved: true) },
+                                onDeny: { viewModel.handleApprovalResponse(id: request.id, approved: false) }
+                            )
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
+
                         // Thinking shimmer — shown while the agent is working
                         if let activity = viewModel.currentActivity,
                            !activity.currentLabel.isEmpty {
@@ -77,6 +88,7 @@ struct ChatView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 16)
                 }
+                .defaultScrollAnchor(.bottom)
                 .overlay(alignment: .bottom) {
                     if !isAtBottom {
                         Button {
@@ -98,12 +110,75 @@ struct ChatView: View {
                         .transition(.scale(scale: 0.5).combined(with: .opacity))
                     }
                 }
-                // -- Auto-scroll handlers removed; add back as needed --
+                .onChange(of: viewModel.messages.count) {
+                    // Scroll to bottom when new messages arrive
+                    if isAtBottom {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    }
+                }
+                .onChange(of: viewModel.messages.last?.content) {
+                    // Auto-scroll as streaming message content grows
+                    if isAtBottom {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                }
                 .scrollDismissesKeyboard(.interactively)
+                // Search overlay
+                .overlay(alignment: .top) {
+                    if showSearch {
+                        MessageSearchView(
+                            messages: viewModel.messages,
+                            isPresented: $showSearch,
+                            onResultTapped: { messageId in
+                                showSearch = false
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    withAnimation {
+                                        proxy.scrollTo(messageId, anchor: .center)
+                                    }
+                                }
+                            }
+                        )
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
             }
 
             // Input bar
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                // Image picker button
+                Button {
+                    viewModel.showImagePicker = true
+                } label: {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.gray)
+                }
+
+                // Image thumbnail preview (if image is staged)
+                if let stagedImage = viewModel.stagedImage {
+                    ZStack(alignment: .topTrailing) {
+                        Image(uiImage: stagedImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 40, height: 40)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                        Button {
+                            viewModel.stagedImage = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.white)
+                                .background(Circle().fill(Color.black.opacity(0.6)))
+                        }
+                        .offset(x: 4, y: -4)
+                    }
+                }
+
                 TextField("Message...", text: $viewModel.inputText, axis: .vertical)
                     .focused($isInputFocused)
                     .lineLimit(1...5)
@@ -112,6 +187,15 @@ struct ChatView: View {
                     .background(Color(.systemGray6))
                     .clipShape(RoundedRectangle(cornerRadius: 20))
 
+                // Mic button for voice input
+                Button {
+                    viewModel.toggleVoiceInput()
+                } label: {
+                    Image(systemName: viewModel.isListening ? "mic.fill" : "mic")
+                        .font(.system(size: 20))
+                        .foregroundStyle(viewModel.isListening ? .red : .gray)
+                }
+
                 Button {
                     isInputFocused = false
                     viewModel.send()
@@ -119,12 +203,12 @@ struct ChatView: View {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: 32))
                         .foregroundStyle(
-                            viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading
-                                ? Color(.systemGray4)
-                                : Color.blue
+                            viewModel.canSend
+                                ? Color.blue
+                                : Color(.systemGray4)
                         )
                 }
-                .disabled(viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading)
+                .disabled(!viewModel.canSend)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
@@ -134,27 +218,34 @@ struct ChatView: View {
             ChatHeaderView(
                 botName: viewModel.botName,
                 isOnline: viewModel.isConnected,
-                taskSummary: viewModel.currentTaskSummary,
+                avatarImage: viewModel.avatarImage,
+                selectedTab: $selectedTab,
                 onSettingsTapped: { viewModel.showSettings = true },
-                onDebugTapped: { viewModel.showDebugLog = true }
+                onDebugTapped: { viewModel.showDebugLog = true },
+                onSearchTapped: {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        showSearch.toggle()
+                    }
+                },
+                isSpeakerEnabled: viewModel.isSpeakerEnabled,
+                onSpeakerToggle: { viewModel.toggleSpeaker() }
             )
         }
         .navigationBarHidden(true)
-        .onAppear {
-            viewModel.connect()
-        }
-        .onChange(of: scenePhase) { oldPhase, newPhase in
-            if oldPhase == .background && newPhase == .active {
-                viewModel.reconnect()
-            }
-        }
         .sheet(isPresented: $viewModel.showSettings) {
             SettingsView(
                 currentIdentity: viewModel.botIdentity,
                 currentProfile: viewModel.userProfile,
+                currentAvatar: viewModel.avatarImage,
                 isConnected: viewModel.isConnected,
                 onSave: { identity, profile in
                     viewModel.saveWorkspaceData(identity: identity, profile: profile)
+                },
+                onSaveAvatar: { image in
+                    viewModel.saveManualAvatar(image)
+                },
+                onDeleteAvatar: {
+                    viewModel.deleteAvatar()
                 },
                 onSaveConnection: {
                     viewModel.reconnect()
@@ -198,9 +289,14 @@ struct ChatView: View {
                 }
             }
         }
+        .sheet(isPresented: $viewModel.showImagePicker) {
+            ImagePickerView { image in
+                viewModel.stagedImage = image
+            }
+        }
     }
 }
 
 #Preview {
-    ChatView()
+    ChatView(viewModel: ChatViewModel(), selectedTab: .constant(.chat))
 }
