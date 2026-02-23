@@ -35,53 +35,54 @@ https://github.com/user-attachments/assets/5af73b21-0ec1-4804-8a40-39dbd2f10adb
 
 ## Prerequisites
 
-- **Mac mini (or any macOS/Linux host)** running OpenClaw gateway
-- **Tailscale** installed on both the gateway host and the iOS device (same tailnet)
+- **A server** running OpenClaw gateway (Mac mini, cloud VM, etc.)
+- **A domain name** pointing to the server (for TLS)
+- **Caddy** (or another reverse proxy) for automatic HTTPS
 - **Xcode 15+** on a Mac to build and install Chowder
 - **iOS 17+** on the target device
 
 ## Architecture
 
 ```
-iPhone (Chowder)                Mac mini (Gateway)
-      |                               |
-      |  ws://<tailscale-ip>:18789    |
-      |------------------------------>|
-      |  connect.challenge (nonce)    |
-      |<------------------------------|
-      |  connect (auth + client info) |
-      |------------------------------>|
-      |  hello-ok (protocol 3)       |
-      |<------------------------------|
-      |                               |
-      |  /verbose on (invisible)      |  --> enables tool summaries
-      |------------------------------>|
-      |  sync: read IDENTITY/USER.md  |  --> agent reads workspace files
-      |------------------------------>|
-      |  chat.final (sync response)   |  --> parsed into BotIdentity/UserProfile
-      |<------------------------------|
-      |                               |
-      |  chat.send (user message)     |  --> Pi agent (RPC)
-      |------------------------------>|
-      |  agent/lifecycle (phase:start)|  --> start polling chat.history
-      |<------------------------------|
-      |  chat.history polling (500ms) |  --> extract thinking + toolCall from content[]
-      |------------------------------>|
-      |  assistant content arrays     |  --> "Appending to weather.txt...", "Updated weather.txt (13ms)"
-      |<------------------------------|
-      |  agent/assistant (text deltas)|  --> streamed into chat bubble
-      |<------------------------------|
-      |  agent/lifecycle (phase:end)  |  --> stop polling, message complete
-      |<------------------------------|
-      |  chat.final (full response)   |
-      |<------------------------------|
+iPhone (Chowder)                  Server (Reverse Proxy + Gateway)
+      |                                     |
+      |  wss://your-domain.com              |
+      |------------------------------------>|  Caddy terminates TLS
+      |  connect.challenge (nonce)          |
+      |<------------------------------------|
+      |  connect (auth + client info)       |
+      |------------------------------------>|
+      |  hello-ok (protocol 3)             |
+      |<------------------------------------|
+      |                                     |
+      |  /verbose on (invisible)            |  --> enables tool summaries
+      |------------------------------------>|
+      |  sync: read IDENTITY/USER.md        |  --> agent reads workspace files
+      |------------------------------------>|
+      |  chat.final (sync response)         |  --> parsed into BotIdentity/UserProfile
+      |<------------------------------------|
+      |                                     |
+      |  chat.send (user message)           |  --> Pi agent (RPC)
+      |------------------------------------>|
+      |  agent/lifecycle (phase:start)      |  --> start polling chat.history
+      |<------------------------------------|
+      |  chat.history polling (500ms)       |  --> extract thinking + toolCall from content[]
+      |------------------------------------>|
+      |  assistant content arrays           |  --> "Appending to weather.txt...", "Updated weather.txt (13ms)"
+      |<------------------------------------|
+      |  agent/assistant (text deltas)      |  --> streamed into chat bubble
+      |<------------------------------------|
+      |  agent/lifecycle (phase:end)        |  --> stop polling, message complete
+      |<------------------------------------|
+      |  chat.final (full response)         |
+      |<------------------------------------|
 ```
 
-Chowder connects as an `openclaw-ios` / `ui` mode operator client using the OpenClaw Gateway Protocol v3. On connect, it silently enables verbose mode and syncs the agent's workspace files to populate the header name and cached identity/profile data.
+Chowder connects as an `openclaw-ios` / `ui` mode operator client using the OpenClaw Gateway Protocol v3 over WSS (WebSocket Secure). A reverse proxy (Caddy) handles TLS termination with automatic Let's Encrypt certificates. On connect, Chowder silently enables verbose mode and syncs the agent's workspace files to populate the header name and cached identity/profile data.
 
 ## Setup Guide
 
-### 1. Install and Start OpenClaw on the Mac mini
+### 1. Install and Start OpenClaw on the Server
 
 ```bash
 npm install -g openclaw@latest
@@ -90,14 +91,14 @@ openclaw onboard --install-daemon
 
 The onboarding wizard will generate a gateway token and install the gateway as a background service.
 
-### 2. Configure the Gateway for Tailscale Access
+### 2. Configure the Gateway
 
-The gateway needs to listen on the Tailscale network interface so your iPhone can reach it. Edit `~/.openclaw/openclaw.json` on the Mac mini:
+The gateway binds to localhost — the reverse proxy handles public-facing connections. Edit `~/.openclaw/openclaw.json`:
 
 ```json
 {
   "gateway": {
-    "bind": "tailnet",
+    "bind": "loopback",
     "auth": {
       "mode": "token",
       "token": "your-gateway-token"
@@ -119,17 +120,49 @@ openclaw gateway status
 openclaw doctor
 ```
 
-### 3. Install Tailscale on Both Devices
+### 3. Set Up the Reverse Proxy (Caddy)
 
-- **Mac mini**: Install Tailscale from [tailscale.com](https://tailscale.com) and sign in
-- **iPhone**: Install the Tailscale app from the App Store and sign in to the same tailnet
-
-Confirm connectivity by finding the Mac mini's Tailscale IP:
+[Caddy](https://caddyserver.com) provides automatic HTTPS via Let's Encrypt with zero configuration. Install it on your server:
 
 ```bash
-# On the Mac mini:
-tailscale ip -4
-# Example output: 100.104.164.27
+# macOS
+brew install caddy
+
+# Ubuntu/Debian
+sudo apt install -y caddy
+
+# Or download from https://caddyserver.com/download
+```
+
+Create a `Caddyfile`:
+
+```
+your-domain.com {
+    reverse_proxy localhost:18789
+}
+```
+
+Start Caddy:
+
+```bash
+caddy start
+```
+
+Caddy will automatically obtain and renew TLS certificates. Ensure your domain's DNS points to the server's public IP and port 443 is open.
+
+#### Alternative: Cloudflare Tunnel (No Open Ports)
+
+If you can't open ports or don't have a static IP, use [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+
+```bash
+# Install cloudflared
+brew install cloudflared  # or see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+
+# Quick tunnel (temporary URL)
+cloudflared tunnel --url http://localhost:18789
+
+# Or set up a persistent tunnel with your domain
+cloudflared tunnel create chowder
 ```
 
 ### 4. Find Your Gateway Token
@@ -161,10 +194,10 @@ In Xcode:
 
 ### 6. Configure Chowder on Your iPhone
 
-1. Open Chowder -- the Settings sheet appears on first launch
+1. Open Chowder — the Settings sheet appears on first launch
 2. *(Optional)* To try UI interactions without OpenClaw, use the **demo** in Settings (e.g. Live Activity demo) — no gateway or token required.
 3. Fill in the fields:
-   - **Gateway**: `ws://<tailscale-ip>:18789` (e.g. `ws://100.104.164.27:18789`)
+   - **Server URL**: `wss://your-domain.com` (or `ws://localhost:18789` for local development)
    - **Token**: paste the gateway token from step 4
    - **Session**: leave as `agent:main:main` (default) or change to target a specific agent
 4. Tap **Save**
@@ -285,15 +318,23 @@ Chowder automatically reconnects after network interruptions with a 3-second bac
 
 ### "Not connected" / stays Offline
 
-- Verify Tailscale is connected on both devices: `tailscale status`
 - Confirm the gateway is running: `openclaw gateway status`
-- Check the gateway URL includes `ws://` (not `http://`)
-- Try pinging the Mac mini's Tailscale IP from the iPhone
+- Check the server URL uses `wss://` (not `http://`)
+- Verify your domain resolves correctly: `nslookup your-domain.com`
+- Check that Caddy is running and certificates are valid: `caddy validate`
 
 ### Connection drops immediately
 
 - Verify the token matches: `openclaw config get gateway.auth.token`
 - Check gateway logs for rejection reasons: `openclaw logs --follow`
+- Check Caddy logs for TLS or proxy errors
+
+### TLS / certificate errors
+
+- Ensure your domain DNS points to the correct IP
+- Check that port 443 is open on your server
+- Verify Caddy obtained certificates: `caddy list-certs`
+- If using Cloudflare Tunnel, check `cloudflared tunnel info`
 
 ### Connected but no AI response
 
@@ -320,11 +361,11 @@ Chowder automatically reconnects after network interruptions with a 3-second bac
 - If you see `"Filtered: X by toolCallId, Y by timestamp → 0 new items"` every poll, all items are from a previous run
 - If the agent responds very quickly (simple questions), there may not be any thinking or tool steps to show
 
-### Gateway not reachable over Tailscale
+### Local development with ws://
 
-- Ensure `gateway.bind` is set to `"tailnet"` (not `"loopback"`)
-- Restart the gateway after config changes: `openclaw gateway restart`
-- Check that the gateway port (18789) is not blocked
+- For local development, `ws://localhost:18789` works without TLS
+- Set `gateway.bind` to `"loopback"` in `openclaw.json`
+- The app allows local networking via ATS exceptions
 
 ## Project Structure
 
@@ -353,12 +394,18 @@ Chowder/
     ThinkingShimmerView.swift    -- Animated "Thinking..." / tool status shimmer line
 ```
 
+## Security
+
+- **Transport**: All remote connections use WSS (WebSocket over TLS). Certificates are issued automatically by Let's Encrypt via Caddy.
+- **Authentication**: Token-based auth via the OpenClaw Gateway Protocol handshake. Tokens are stored in the iOS Keychain.
+- **ATS**: App Transport Security enforces TLS for remote connections. Local networking (`ws://localhost`) is allowed for development.
+- **No custom certificate trust**: Unlike the Tailscale-based setup, this version relies entirely on the system trust chain with CA-signed certificates.
+
 ## OpenClaw Protocol Reference
 
 - [Gateway Protocol](https://docs.openclaw.ai/gateway/protocol) -- WebSocket framing and handshake
 - [Thinking Levels](https://docs.openclaw.ai/tools/thinking) -- `/verbose`, `/think`, `/reasoning` directives
 - [Agent Loop](https://docs.openclaw.ai/concepts/agent-loop) -- How the agent processes messages
-- [Tailscale Setup](https://docs.openclaw.ai/gateway/tailscale) -- Network access via Tailscale
 - [Configuration](https://docs.openclaw.ai/gateway/configuration) -- All gateway config keys
 
 ## License

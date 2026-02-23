@@ -257,7 +257,7 @@ final class ChatViewModel: ChatServiceDelegate {
         chatService?.disconnect()
 
         let service = ChatService(
-            gatewayURL: config.gatewayURL,
+            gatewayURL: config.effectiveGatewayURL,
             token: config.token,
             sessionKey: config.sessionKey
         )

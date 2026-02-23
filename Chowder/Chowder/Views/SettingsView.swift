@@ -68,10 +68,10 @@ struct SettingsView: View {
                     } label: {
                         GlassCard {
                             HStack(spacing: 12) {
-                                GlassIcon(systemName: "macmini")
+                                GlassIcon(systemName: "server.rack")
 
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Mac Mini")
+                                    Text("Server")
                                         .font(.system(size: 16, weight: .semibold))
                                         .foregroundStyle(.primary)
 
@@ -493,11 +493,16 @@ struct ConnectionDetailView: View {
                         .padding(.horizontal, 4)
 
                     GlassCard(padding: 0) {
-                        GlassTextField(label: "URL", placeholder: "ws://100.x.y.z:18789", text: $gatewayURL)
+                        GlassTextField(label: "URL", placeholder: "wss://your-domain.com", text: $gatewayURL)
                             .textContentType(.URL)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                     }
+
+                    Text("Use wss:// for secure connections. ws:// is allowed for local development.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 4)
                 }
 
                 // Authentication
@@ -558,7 +563,7 @@ struct ConnectionDetailView: View {
             .padding(.bottom, 32)
         }
         .background(Color(.systemGroupedBackground))
-        .navigationTitle("Mac Mini")
+        .navigationTitle("Server")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             let config = ConnectionConfig()

@@ -152,6 +152,10 @@ final class ChatService: NSObject {
 
         log("[CONNECT] URL scheme=\(url.scheme ?? "nil") host=\(url.host ?? "nil") port=\(url.port ?? -1)")
 
+        if let scheme = url.scheme, scheme == "ws" {
+            log("[CONNECT] ⚠️ Using insecure ws:// — use wss:// for production")
+        }
+
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.urlSession = session
 
@@ -883,19 +887,7 @@ extension ChatService: URLSessionWebSocketDelegate {
         }
     }
 
-    // Trust Tailscale's .ts.net TLS certificates
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        let host = challenge.protectionSpace.host
-        log("[TLS] Challenge for host=\(host) method=\(challenge.protectionSpace.authenticationMethod)")
-
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           host.hasSuffix(".ts.net"),
-           let trust = challenge.protectionSpace.serverTrust {
-            log("[TLS] Trusting .ts.net certificate for \(host)")
-            completionHandler(.useCredential, URLCredential(trust: trust))
-            return
-        }
-
         completionHandler(.performDefaultHandling, nil)
     }
 
