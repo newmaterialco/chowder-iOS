@@ -319,6 +319,33 @@ final class ChatService: NSObject {
         }
     }
 
+    // MARK: - Private: Workspace File Sync
+
+    /// Fetch a workspace file from the gateway after connecting.
+    private func fetchWorkspaceFile(_ fileName: String) {
+        let requestId = makeRequestId()
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": requestId,
+            "method": "agents.files.get",
+            "params": [
+                "agentId": "main",
+                "name": fileName
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            log("[SYNC] ❌ Failed to serialize \(fileName) fetch request")
+            return
+        }
+        log("[SYNC] Fetching \(fileName)")
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error {
+                self?.log("[SYNC] ❌ Error fetching \(fileName): \(error.localizedDescription)")
+            }
+        }
+    }
+
     // MARK: - Private: Connect Handshake
 
     /// Send the `connect` request after receiving the gateway's challenge nonce.
@@ -328,7 +355,20 @@ final class ChatService: NSObject {
         // Valid client IDs: webchat-ui, openclaw-control-ui, webchat, cli,
         //   gateway-client, openclaw-macos, openclaw-ios, openclaw-android, node-host, test
         // Valid client modes: webchat, cli, ui, backend, node, probe, test
-        // Device identity is schema-optional; omit until we implement keypair signing.
+        let clientId = "openclaw-ios"
+        let clientMode = "ui"
+        let role = "operator"
+        let scopes = ["operator.read", "operator.write"]
+
+        let signed = DeviceIdentity.sign(
+            clientId: clientId,
+            clientMode: clientMode,
+            role: role,
+            scopes: scopes,
+            token: token,
+            nonce: nonce
+        )
+
         let frame: [String: Any] = [
             "type": "req",
             "id": requestId,
@@ -337,15 +377,22 @@ final class ChatService: NSObject {
                 "minProtocol": 3,
                 "maxProtocol": 3,
                 "client": [
-                    "id": "openclaw-ios",
+                    "id": clientId,
                     "version": "1.0.0",
                     "platform": "ios",
-                    "mode": "ui"
+                    "mode": clientMode
                 ],
-                "role": "operator",
-                "scopes": ["operator.read", "operator.write"],
+                "role": role,
+                "scopes": scopes,
                 "auth": [
                     "token": token
+                ],
+                "device": [
+                    "id": DeviceIdentity.deviceId,
+                    "publicKey": DeviceIdentity.publicKeyBase64Url,
+                    "signature": signed.signature,
+                    "signedAt": signed.signedAt,
+                    "nonce": nonce
                 ],
                 "locale": Locale.current.identifier,
                 "userAgent": "chowder-ios/1.0.0"
@@ -609,6 +656,30 @@ final class ChatService: NSObject {
                 DispatchQueue.main.async { [weak self] in
                     self?.isConnected = true
                     self?.delegate?.chatServiceDidConnect()
+                }
+
+                // Fetch IDENTITY.md and USER.md from workspace
+                fetchWorkspaceFile("IDENTITY.md")
+                fetchWorkspaceFile("USER.md")
+                return
+            }
+
+            // Handle agents.files.get response (workspace file sync)
+            if let file = payload?["file"] as? [String: Any],
+               let content = file["content"] as? String,
+               let filePath = (file["name"] as? String) ?? (file["path"] as? String) {
+                if filePath.hasSuffix("IDENTITY.md") {
+                    let identity = BotIdentity.from(markdown: content)
+                    log("[SYNC] Fetched IDENTITY.md — name=\(identity.name)")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.chatServiceDidUpdateBotIdentity(identity)
+                    }
+                } else if filePath.hasSuffix("USER.md") {
+                    let profile = UserProfile.from(markdown: content)
+                    log("[SYNC] Fetched USER.md — name=\(profile.name)")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.chatServiceDidUpdateUserProfile(profile)
+                    }
                 }
                 return
             }
