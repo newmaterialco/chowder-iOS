@@ -7,6 +7,10 @@ enum KeychainService {
 
     static func save(key: String, value: String) {
         guard let data = value.data(using: .utf8) else { return }
+        save(key: key, data: data)
+    }
+
+    static func save(key: String, data: Data) {
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -24,6 +28,14 @@ enum KeychainService {
     }
 
     static func load(key: String) -> String? {
+        guard let data = loadData(key: key),
+              let string = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return string
+    }
+
+    static func loadData(key: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -36,12 +48,10 @@ enum KeychainService {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
         guard status == errSecSuccess,
-              let data = result as? Data,
-              let string = String(data: data, encoding: .utf8) else {
+              let data = result as? Data else {
             return nil
         }
-
-        return string
+        return data
     }
 
     static func delete(key: String) {

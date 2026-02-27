@@ -1,5 +1,4 @@
 import Foundation
-import UIKit
 
 protocol ChatServiceDelegate: AnyObject {
     func chatServiceDidConnect()
@@ -22,6 +21,10 @@ final class ChatService: NSObject {
     private let gatewayURL: String
     private let token: String
     private let sessionKey: String
+    private let clientId = "openclaw-ios"
+    private let clientMode = "ui"
+    private let role = "operator"
+    private let scopes = ["operator.read", "operator.write"]
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
@@ -29,9 +32,6 @@ final class ChatService: NSObject {
     private var shouldReconnect = true
     private var isReconnecting = false
     private var hasSentConnectRequest = false
-
-    /// Stable device identifier persisted across launches (used for device pairing).
-    private let deviceId: String
 
     /// Monotonically increasing request ID counter.
     private var nextRequestId: Int = 1
@@ -61,22 +61,8 @@ final class ChatService: NSObject {
         self.token = token
         self.sessionKey = sessionKey
 
-        // Use identifierForVendor when available; fall back to a UUID persisted in UserDefaults.
-        if let vendorId = UIDevice.current.identifierForVendor?.uuidString {
-            self.deviceId = vendorId
-        } else {
-            let key = "com.chowder.deviceId"
-            if let stored = UserDefaults.standard.string(forKey: key) {
-                self.deviceId = stored
-            } else {
-                let generated = UUID().uuidString
-                UserDefaults.standard.set(generated, forKey: key)
-                self.deviceId = generated
-            }
-        }
-
         super.init()
-        log("[INIT] gatewayURL=\(self.gatewayURL) sessionKey=\(self.sessionKey) tokenLength=\(token.count) deviceId=\(deviceId)")
+        log("[INIT] gatewayURL=\(self.gatewayURL) sessionKey=\(self.sessionKey) tokenLength=\(token.count)")
     }
 
     private func log(_ msg: String) {
@@ -396,11 +382,42 @@ final class ChatService: NSObject {
     /// Send the `connect` request after receiving the gateway's challenge nonce.
     /// Protocol: https://docs.openclaw.ai/gateway/protocol
     private func sendConnectRequest(nonce: String) {
+        let authToken = DeviceIdentityService.loadDeviceToken() ?? token
+        let authSource = authToken == token ? "gatewayToken" : "deviceToken"
+
+        let identity: DeviceIdentity
+        do {
+            identity = try DeviceIdentityService.loadOrCreateIdentity()
+        } catch {
+            log("[AUTH] ❌ Failed to load/create device identity: \(error.localizedDescription)")
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.chatServiceDidReceiveError(error)
+            }
+            return
+        }
+
+        let signedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let signature: DeviceSignature
+        do {
+            signature = try DeviceIdentityService.signConnectPayload(
+                identity: identity,
+                clientId: clientId,
+                clientMode: clientMode,
+                role: role,
+                scopes: scopes,
+                signedAtMs: signedAtMs,
+                token: authToken,
+                nonce: nonce
+            )
+        } catch {
+            log("[AUTH] ❌ Failed to sign device payload: \(error.localizedDescription)")
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.chatServiceDidReceiveError(error)
+            }
+            return
+        }
+
         let requestId = makeRequestId()
-        // Valid client IDs: webchat-ui, openclaw-control-ui, webchat, cli,
-        //   gateway-client, openclaw-macos, openclaw-ios, openclaw-android, node-host, test
-        // Valid client modes: webchat, cli, ui, backend, node, probe, test
-        // Device identity is schema-optional; omit until we implement keypair signing.
         let frame: [String: Any] = [
             "type": "req",
             "id": requestId,
@@ -409,15 +426,22 @@ final class ChatService: NSObject {
                 "minProtocol": 3,
                 "maxProtocol": 3,
                 "client": [
-                    "id": "openclaw-ios",
+                    "id": clientId,
                     "version": "1.0.0",
                     "platform": "ios",
-                    "mode": "ui"
+                    "mode": clientMode
                 ],
-                "role": "operator",
-                "scopes": ["operator.read", "operator.write"],
+                "role": role,
+                "scopes": scopes,
                 "auth": [
-                    "token": token
+                    "token": authToken
+                ],
+                "device": [
+                    "id": identity.id,
+                    "publicKey": identity.publicKey,
+                    "signature": signature.signature,
+                    "signedAt": signature.signedAt,
+                    "nonce": nonce
                 ],
                 "locale": Locale.current.identifier,
                 "userAgent": "chowder-ios/1.0.0"
@@ -430,7 +454,7 @@ final class ChatService: NSObject {
             return
         }
 
-        log("[AUTH] Sending connect request: \(jsonString)")
+        log("[AUTH] Sending connect request id=\(requestId) auth=\(authSource) deviceId=\(identity.id.prefix(12))... signedAt=\(signedAtMs)")
         webSocketTask?.send(.string(jsonString)) { [weak self] error in
             if let error {
                 self?.log("[AUTH] ❌ Error sending connect: \(error.localizedDescription)")
@@ -711,6 +735,12 @@ final class ChatService: NSObject {
             if payloadType == "hello-ok" {
                 let proto = payload?["protocol"] as? Int ?? 0
                 log("[AUTH] ✅ hello-ok — protocol=\(proto) id=\(id)")
+                if let auth = payload?["auth"] as? [String: Any],
+                   let deviceToken = auth["deviceToken"] as? String,
+                   !deviceToken.isEmpty {
+                    DeviceIdentityService.saveDeviceToken(deviceToken)
+                    log("[AUTH] Stored device token from hello-ok")
+                }
 
                 DispatchQueue.main.async { [weak self] in
                     self?.isConnected = true
