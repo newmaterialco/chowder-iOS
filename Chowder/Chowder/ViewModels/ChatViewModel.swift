@@ -281,7 +281,9 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         let service = ChatService(
             gatewayURL: config.gatewayURL,
             token: config.token,
-            sessionKey: config.sessionKey
+            sessionKey: config.sessionKey,
+            cfAccessClientId: config.cfAccessClientId,
+            cfAccessClientSecret: config.cfAccessClientSecret
         )
         service.delegate = self
         self.chatService = service
