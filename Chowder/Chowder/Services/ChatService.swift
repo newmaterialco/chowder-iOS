@@ -22,6 +22,8 @@ final class ChatService: NSObject {
     private let gatewayURL: String
     private let token: String
     private let sessionKey: String
+    private let cfAccessClientId: String
+    private let cfAccessClientSecret: String
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
@@ -56,10 +58,12 @@ final class ChatService: NSObject {
     private var visibleRunStartedAt: Date?
     private var hiddenRunIds: Set<String> = []
 
-    init(gatewayURL: String, token: String, sessionKey: String = "agent:main:main") {
+    init(gatewayURL: String, token: String, sessionKey: String = "agent:main:main", cfAccessClientId: String = "", cfAccessClientSecret: String = "") {
         self.gatewayURL = gatewayURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.token = token
         self.sessionKey = sessionKey
+        self.cfAccessClientId = cfAccessClientId
+        self.cfAccessClientSecret = cfAccessClientSecret
 
         // Use identifierForVendor when available; fall back to a UUID persisted in UserDefaults.
         if let vendorId = UIDevice.current.identifierForVendor?.uuidString {
@@ -166,7 +170,16 @@ final class ChatService: NSObject {
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.urlSession = session
 
-        let task = session.webSocketTask(with: url)
+        // Use URLRequest so we can inject HTTP headers before the WebSocket upgrade.
+        // CF-Access headers must be present in the initial HTTP upgrade request —
+        // they cannot be sent after the connection is established.
+        var request = URLRequest(url: url)
+        if !cfAccessClientId.isEmpty && !cfAccessClientSecret.isEmpty {
+            request.setValue(cfAccessClientId, forHTTPHeaderField: "CF-Access-Client-ID")
+            request.setValue(cfAccessClientSecret, forHTTPHeaderField: "CF-Access-Client-Secret")
+            log("[CONNECT] CF-Access headers injected")
+        }
+        let task = session.webSocketTask(with: request)
         self.webSocketTask = task
         log("[CONNECT] Calling task.resume() ...")
         task.resume()

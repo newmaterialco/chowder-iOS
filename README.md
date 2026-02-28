@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/5af73b21-0ec1-4804-8a40-39dbd2f10adb
 ## Prerequisites
 
 - **Mac mini (or any macOS/Linux host)** running OpenClaw gateway
-- **Tailscale** installed on both the gateway host and the iOS device (same tailnet)
+- **Tailscale** installed on both the gateway host and the iOS device (same tailnet), **or** a **Cloudflare Tunnel** (`cloudflared`) exposing the gateway with **Cloudflare Access** protecting it via service token (see step 3b below)
 - **Xcode 15+** on a Mac to build and install Chowder
 - **iOS 17+** on the target device
 
@@ -134,6 +134,41 @@ tailscale ip -4
 # Example output: 100.104.164.27
 ```
 
+### 3b. (Alternative) Expose the Gateway via Cloudflare Tunnel + Access
+
+Instead of Tailscale, you can expose the gateway publicly using a **Cloudflare Tunnel** (`cloudflared`) and protect it with **Cloudflare Access** (part of the Zero Trust platform) using a service token for machine-to-machine authentication.
+
+**On the gateway host:**
+
+1. Install and authenticate `cloudflared`:
+   ```bash
+   brew install cloudflare/cloudflare/cloudflared
+   cloudflared tunnel login
+   ```
+2. Create a tunnel and route it to the gateway:
+   ```bash
+   cloudflared tunnel create my-gateway
+   cloudflared tunnel route dns my-gateway gateway.yourdomain.com
+   ```
+3. Configure the tunnel to forward to the local gateway port (`~/.cloudflared/config.yml`):
+   ```yaml
+   tunnel: <tunnel-id>
+   credentials-file: ~/.cloudflared/<tunnel-id>.json
+   ingress:
+     - hostname: gateway.yourdomain.com
+       service: http://localhost:18789
+     - service: http_status:404
+   ```
+4. Start the tunnel: `cloudflared tunnel run my-gateway`
+
+**In the Cloudflare Zero Trust dashboard:**
+
+1. Go to **Access → Applications** and create an application for `gateway.yourdomain.com`
+2. Add a **Service Auth** policy (not Allow) and attach a service token to it
+3. Go to **Access → Service Auth → Service Tokens** and create a token — copy the **Client ID** and **Client Secret**
+
+The gateway URL to use in Chowder will be `wss://gateway.yourdomain.com` (port 443, no explicit port needed).
+
 ### 4. Find Your Gateway Token
 
 The gateway token was generated during onboarding. To find it:
@@ -166,9 +201,10 @@ In Xcode:
 1. Open Chowder -- the Settings sheet appears on first launch
 2. *(Optional)* To try UI interactions without OpenClaw, use the **demo** in Settings (e.g. Live Activity demo) — no gateway or token required.
 3. Fill in the fields:
-   - **Gateway**: `ws://<tailscale-ip>:18789` (e.g. `ws://100.104.164.27:18789`)
+   - **Gateway**: `ws://<tailscale-ip>:18789` (e.g. `ws://100.104.164.27:18789`), or `wss://gateway.yourdomain.com` if using Cloudflare Zero Trust
    - **Token**: paste the gateway token from step 4
    - **Session**: leave as `agent:main:main` (default) or change to target a specific agent
+   - **Cloudflare Zero Trust** *(optional)*: enable the toggle and paste the **Client ID** and **Client Secret** of your service token (from step 3b). These are sent as `CF-Access-Client-ID` / `CF-Access-Client-Secret` headers during the WebSocket upgrade and stored securely in the Keychain.
 4. Tap **Save**
 
 Chowder will connect to the gateway, complete the WebSocket handshake, and show **Online** in the header.
@@ -347,6 +383,15 @@ Expected result after fix:
 - If you see `"Filtered: X by toolCallId, Y by timestamp → 0 new items"` every poll, all items are from a previous run
 - If the agent responds very quickly (simple questions), there may not be any thinking or tool steps to show
 
+### Cloudflare Zero Trust — connection hangs or gets a 302 redirect
+
+If the WebSocket connection hangs at "waiting for didOpen" or `curl` returns a `302` redirect to `cloudflareaccess.com`:
+
+- **Check `service_token_status` in the redirect JWT**: decode the `meta` query param — if `"service_token_status": false`, Cloudflare didn't accept the token
+- **Verify the Access policy**: the application must have a **Service Auth** policy (not an Allow policy) with the service token explicitly allowed. Identity-based policies (email, IdP groups) do not accept service tokens.
+- **Verify the credentials**: go to **Access → Service Auth → Service Tokens** and confirm the Client ID and Secret match what's in Chowder. Regenerating a token invalidates the old secret.
+- **Check the port**: Cloudflare only proxies standard HTTPS ports. Use `wss://gateway.yourdomain.com` (port 443) — not `wss://gateway.yourdomain.com:18789`.
+
 ### Gateway not reachable over Tailscale
 
 - Ensure `gateway.bind` is set to `"tailnet"` (not `"loopback"`)
@@ -361,7 +406,7 @@ Chowder/
   Models/
     AgentActivity.swift          -- Thinking/tool step tracking for shimmer
     BotIdentity.swift            -- Parsed IDENTITY.md model + markdown serialization
-    ConnectionConfig.swift       -- Gateway URL, token, session key storage
+    ConnectionConfig.swift       -- Gateway URL, token, session key, and Cloudflare Zero Trust credentials (Keychain)
     Message.swift                -- Chat message model (Codable, persisted)
     UserProfile.swift            -- Parsed USER.md model + markdown serialization
   Services/

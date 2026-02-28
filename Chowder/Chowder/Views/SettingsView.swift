@@ -491,6 +491,9 @@ struct ConnectionDetailView: View {
     @State private var gatewayURL: String = ""
     @State private var token: String = ""
     @State private var sessionKey: String = ""
+    @State private var cfAccessEnabled: Bool = false
+    @State private var cfAccessClientId: String = ""
+    @State private var cfAccessClientSecret: String = ""
 
     var body: some View {
         ScrollView {
@@ -537,6 +540,64 @@ struct ConnectionDetailView: View {
                     }
                 }
 
+                // Cloudflare Zero Trust
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Cloudflare Zero Trust")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                        .padding(.horizontal, 4)
+
+                    GlassCard(padding: 0) {
+                        VStack(spacing: 0) {
+                            HStack {
+                                Text("Enable")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Toggle("", isOn: $cfAccessEnabled.animation())
+                                    .labelsHidden()
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 13)
+
+                            if cfAccessEnabled {
+                                Divider().padding(.leading, 16)
+
+                                HStack {
+                                    Text("Client ID")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(.primary)
+                                        .frame(width: 80, alignment: .leading)
+
+                                    SecureField("Service token client ID", text: $cfAccessClientId)
+                                        .font(.system(size: 16))
+                                        .autocorrectionDisabled()
+                                        .textInputAutocapitalization(.never)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 13)
+
+                                Divider().padding(.leading, 16)
+
+                                HStack {
+                                    Text("Secret")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(.primary)
+                                        .frame(width: 80, alignment: .leading)
+
+                                    SecureField("Service token secret", text: $cfAccessClientSecret)
+                                        .font(.system(size: 16))
+                                        .autocorrectionDisabled()
+                                        .textInputAutocapitalization(.never)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 13)
+                            }
+                        }
+                    }
+                }
+
                 // Session
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Session")
@@ -561,6 +622,8 @@ struct ConnectionDetailView: View {
                     config.gatewayURL = gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     config.token = token.trimmingCharacters(in: .whitespacesAndNewlines)
                     config.sessionKey = sessionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    config.cfAccessClientId = cfAccessEnabled ? cfAccessClientId.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                    config.cfAccessClientSecret = cfAccessEnabled ? cfAccessClientSecret.trimmingCharacters(in: .whitespacesAndNewlines) : ""
                     onSave?()
                     dismiss()
                 }
@@ -577,6 +640,9 @@ struct ConnectionDetailView: View {
             gatewayURL = config.gatewayURL
             token = config.token
             sessionKey = config.sessionKey
+            cfAccessEnabled = config.hasCloudflareAccessTokens
+            cfAccessClientId = config.cfAccessClientId
+            cfAccessClientSecret = config.cfAccessClientSecret
         }
     }
 }
